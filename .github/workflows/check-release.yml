@@ -1,30 +1,44 @@
-name: Check Playwright Release
+name: Playwrightリリース監視
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   TARGET_REPO: microsoft/playwright
+  STATE_FILE: state/last_tag.txt
 
 jobs:
-  check:
+  check-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Checkout
+      - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Pythonをセットアップ
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Fetch latest release
+      - name: 最新リリースを確認
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET_REPO: ${{ env.TARGET_REPO }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python scripts/check_release.py
+
+      - name: 状態ファイルをコミットしてプッシュ
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/last_tag.txt
+          if git diff --cached --quiet; then
+            echo "状態ファイルに変更はありません。"
+          else
+            git commit -m "状態ファイルを更新"
+            git push
+          fi
