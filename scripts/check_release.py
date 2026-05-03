@@ -6,8 +6,10 @@ import json
 import os
 import pathlib
 import sys
+import datetime
 import urllib.error
 import urllib.request
+import zoneinfo
 
 DEFAULT_REPO = "microsoft/playwright"
 DEFAULT_STATE_FILE = "state/last_tag.txt"
@@ -15,9 +17,9 @@ USER_AGENT = "playwright-update-watcher"
 DISCORD_COLOR = 5814783
 
 
-def fetch_latest_release(repo: str, token: str | None) -> dict[str, object]:
-    """指定したGitHubリポジトリの最新リリース情報を取得します。"""
-    url = f"https://api.github.com/repos/{repo}/releases/latest"
+def fetch_recent_releases(repo: str, token: str | None, per_page: int = 10) -> list[dict]:
+    """指定したGitHubリポジトリの最近のリリース情報を取得します。"""
+    url = f"https://api.github.com/repos/{repo}/releases?per_page={per_page}"
     headers: dict[str, str] = {
         "Accept": "application/vnd.github+json",
         "User-Agent": USER_AGENT,
@@ -30,14 +32,53 @@ def fetch_latest_release(repo: str, token: str | None) -> dict[str, object]:
     with urllib.request.urlopen(request, timeout=30) as response:
         data: object = json.loads(response.read().decode("utf-8"))
 
-    if not isinstance(data, dict):
+    if not isinstance(data, list):
         raise ValueError("GitHub APIの応答形式が想定外です。")
 
-    release: dict[str, object] = {}
-    for key, value in data.items():
-        if isinstance(key, str):
-            release[key] = value
-    return release
+    releases: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            raise ValueError("GitHub APIの応答形式が想定外です。")
+        release: dict[str, object] = {}
+        for key, value in item.items():
+            if isinstance(key, str):
+                release[key] = value
+        releases.append(release)
+
+    return releases
+
+
+def filter_new_releases(releases: list[dict], last_tag: str | None) -> list[dict]:
+    """前回タグ以降の新しい通常リリースだけを抽出します。"""
+    release_candidates = [
+        release
+        for release in releases
+        if release.get("prerelease") is not True and release.get("draft") is not True
+    ]
+
+    if last_tag is None:
+        return []
+
+    for index, release in enumerate(release_candidates):
+        tag_value = release.get("tag_name")
+        if isinstance(tag_value, str) and tag_value.strip() == last_tag:
+            return release_candidates[:index]
+
+    return release_candidates[:1]
+
+
+def format_jst(iso8601_utc: str) -> str:
+    """UTCのISO 8601日時をJST表示へ変換します。"""
+    normalized_value = iso8601_utc.strip()
+    if normalized_value.endswith("Z"):
+        normalized_value = f"{normalized_value[:-1]}+00:00"
+
+    published_at = datetime.datetime.fromisoformat(normalized_value)
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=datetime.timezone.utc)
+
+    jst = zoneinfo.ZoneInfo("Asia/Tokyo")
+    return published_at.astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
 
 
 def read_last_tag(state_file: pathlib.Path) -> str | None:
@@ -57,42 +98,61 @@ def write_last_tag(state_file: pathlib.Path, tag_name: str) -> None:
     state_file.write_text(f"{tag_name}\n", encoding="utf-8")
 
 
-def notify_discord(release: dict[str, object], webhook_url: str | None) -> bool:
+def notify_discord(releases: list[dict], webhook_url: str | None) -> bool:
     """Discord webhookへリリース通知を送信します。"""
-    tag_value = release.get("tag_name")
-    if not isinstance(tag_value, str) or not tag_value.strip():
-        print("Discord通知に必要なタグ名が取得できませんでした。", file=sys.stderr)
-        return False
-    tag_name = tag_value.strip()
+    embeds: list[dict[str, object]] = []
+    tag_names: list[str] = []
 
-    if webhook_url is None or not webhook_url.strip():
-        print(f"Discord webhook URLが未設定のため通知をスキップしました: {tag_name}")
+    for release in releases:
+        tag_value = release.get("tag_name")
+        if not isinstance(tag_value, str) or not tag_value.strip():
+            print("Discord通知に必要なタグ名が取得できませんでした。", file=sys.stderr)
+            return False
+        tag_name = tag_value.strip()
+        tag_names.append(tag_name)
+
+        url_value = release.get("html_url")
+        if not isinstance(url_value, str) or not url_value.strip():
+            print("Discord通知に必要なリリースURLが取得できませんでした。", file=sys.stderr)
+            return False
+        release_url = url_value.strip()
+
+        published_value = release.get("published_at")
+        if not isinstance(published_value, str) or not published_value.strip():
+            print("Discord通知に必要な公開日時が取得できませんでした。", file=sys.stderr)
+            return False
+        try:
+            published_at = format_jst(published_value)
+        except ValueError as error:
+            print(f"Discord通知に必要な公開日時の形式が不正です: {error}", file=sys.stderr)
+            return False
+
+        name_value = release.get("name")
+        release_name = name_value.strip() if isinstance(name_value, str) and name_value.strip() else tag_name
+
+        body_value = release.get("body")
+        release_body = body_value if isinstance(body_value, str) else ""
+        changelog = release_body[:1500] if release_body else "本文なし"
+
+        embed: dict[str, object] = {
+            "title": f"新しいリリース: {tag_name}",
+            "url": release_url,
+            "description": f"{release_name}\n公開日時: {published_at}\n\n{changelog}",
+            "color": DISCORD_COLOR,
+        }
+        embeds.append(embed)
+
+    if not tag_names:
+        print("Discord通知対象のリリースがありません。")
         return True
 
-    url_value = release.get("html_url")
-    if not isinstance(url_value, str) or not url_value.strip():
-        print("Discord通知に必要なリリースURLが取得できませんでした。", file=sys.stderr)
-        return False
-    release_url = url_value.strip()
+    if webhook_url is None or not webhook_url.strip():
+        print(f"Discord webhook URLが未設定のため通知をスキップしました: {', '.join(tag_names)}")
+        return True
 
-    published_value = release.get("published_at")
-    if not isinstance(published_value, str) or not published_value.strip():
-        print("Discord通知に必要な公開日時が取得できませんでした。", file=sys.stderr)
-        return False
-    published_at = published_value.strip()
-
-    name_value = release.get("name")
-    release_name = name_value.strip() if isinstance(name_value, str) and name_value.strip() else tag_name
-
-    embed: dict[str, object] = {
-        "title": f"新しいリリース: {tag_name}",
-        "url": release_url,
-        "description": f"{release_name}\n公開日時: {published_at}",
-        "color": DISCORD_COLOR,
-    }
     payload: dict[str, object] = {
         "username": "Playwrightリリース監視",
-        "embeds": [embed],
+        "embeds": embeds,
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(webhook_url.strip(), data=body)
@@ -113,7 +173,7 @@ def notify_discord(release: dict[str, object], webhook_url: str | None) -> bool:
         print(f"Discord通知に失敗しました: HTTP {status_code}", file=sys.stderr)
         return False
 
-    print(f"Discordへ通知しました: {tag_name}")
+    print(f"Discordへ通知しました: {', '.join(tag_names)}")
     return True
 
 
@@ -126,7 +186,7 @@ def main() -> int:
     state_file = pathlib.Path(state_file_value)
 
     try:
-        release = fetch_latest_release(repo, token)
+        releases = fetch_recent_releases(repo, token)
     except urllib.error.HTTPError as error:
         print(f"GitHub APIの取得に失敗しました: HTTP {error.code} {error.reason}", file=sys.stderr)
         return 1
@@ -137,7 +197,16 @@ def main() -> int:
         print(f"GitHub APIの取得に失敗しました: {error}", file=sys.stderr)
         return 1
 
-    tag_value = release.get("tag_name")
+    release_candidates = [
+        release
+        for release in releases
+        if release.get("prerelease") is not True and release.get("draft") is not True
+    ]
+    if not release_candidates:
+        print("GitHub APIの応答に通常リリースが含まれていません。", file=sys.stderr)
+        return 1
+
+    tag_value = release_candidates[0].get("tag_name")
     if not isinstance(tag_value, str) or not tag_value.strip():
         print("GitHub APIの応答にタグ名が含まれていません。", file=sys.stderr)
         return 1
@@ -158,20 +227,27 @@ def main() -> int:
         print(f"初回実行のため通知せず状態ファイルへ保存しました: {tag_name}")
         return 0
 
-    if last_tag == tag_name:
-        print(f"変更なし: {tag_name}")
+    new_releases = filter_new_releases(releases, last_tag)
+    if not new_releases:
+        print(f"変更なし: {last_tag}")
         return 0
 
-    if not notify_discord(release, webhook_url):
+    if not notify_discord(new_releases, webhook_url):
         return 1
 
+    latest_tag_value = new_releases[0].get("tag_name")
+    if not isinstance(latest_tag_value, str) or not latest_tag_value.strip():
+        print("GitHub APIの応答にタグ名が含まれていません。", file=sys.stderr)
+        return 1
+    latest_tag = latest_tag_value.strip()
+
     try:
-        write_last_tag(state_file, tag_name)
+        write_last_tag(state_file, latest_tag)
     except OSError as error:
         print(f"状態ファイルの書き込みに失敗しました: {error}", file=sys.stderr)
         return 1
 
-    print(f"新しいリリースを状態ファイルへ保存しました: {tag_name}")
+    print(f"新しいリリースを状態ファイルへ保存しました: {latest_tag}")
     return 0
 
 

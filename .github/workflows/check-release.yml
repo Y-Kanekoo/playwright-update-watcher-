@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: check-release
+  cancel-in-progress: false
+
 env:
   TARGET_REPO: microsoft/playwright
   STATE_FILE: state/last_tag.txt
@@ -42,3 +46,49 @@ jobs:
             git commit -m "状態ファイルを更新"
             git push
           fi
+
+      - name: 失敗をDiscordへ通知
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "Discord webhook URLが未設定のため失敗通知をスキップしました。"
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
+          run_url = os.environ["RUN_URL"]
+          payload = {
+              "username": "Playwrightリリース監視",
+              "content": f"Playwrightリリース監視ワークフローが失敗しました: {run_url}",
+          }
+          body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+          request = urllib.request.Request(webhook_url, data=body)
+          request.add_header("User-Agent", "playwright-update-watcher")
+          request.add_header("Content-Type", "application/json")
+
+          try:
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  status_code = response.getcode()
+          except urllib.error.HTTPError as error:
+              print(f"失敗通知に失敗しました: HTTP {error.code} {error.reason}", file=sys.stderr)
+              raise SystemExit(1)
+          except urllib.error.URLError as error:
+              print(f"失敗通知に失敗しました: {error.reason}", file=sys.stderr)
+              raise SystemExit(1)
+
+          if status_code < 200 or status_code >= 300:
+              print(f"失敗通知に失敗しました: HTTP {status_code}", file=sys.stderr)
+              raise SystemExit(1)
+
+          print("失敗通知をDiscordへ送信しました。")
+          PY
