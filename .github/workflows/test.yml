@@ -1,0 +1,21 @@
+name: ユニットテスト
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v6
+
+      - name: Pythonをセットアップ
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: ユニットテストを実行
+        run: python -m unittest discover -s tests -v
