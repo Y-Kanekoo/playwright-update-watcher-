@@ -1,5 +1,6 @@
 """未配信状態の回帰。標準ライブラリとHTTP stubだけで検証する。"""
 import contextlib
+import gc
 import io
 import json
 import os
@@ -9,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import urllib.error
+import warnings
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import check_release as app
@@ -95,13 +97,20 @@ class DeliveryStateTest(unittest.TestCase):
 
     def test_http_failure_preserves_state_then_retries(self):
         self.enable_webhook()
-        for code in (401, 429, 500, 503):
-            with self.subTest(status=code):
-                self.failure = urllib.error.HTTPError("https://discord.test/stub-secret", code,
-                                                      "stub-secret", {}, None)
-                self.assertEqual(1, app.main())
-                self.assertEqual("v1\n", self.state.read_text())
-        self.failure = None
+        # stderr 検査と別に、GC後もテスト用responseの未解放警告が無いことを確認する。
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            for code in (401, 429, 500, 503):
+                with self.subTest(status=code):
+                    with contextlib.closing(urllib.error.HTTPError(
+                        "https://discord.test/stub-secret", code, "stub-secret", {}, None,
+                    )) as self.failure:
+                        self.assertEqual(1, app.main())
+                        self.assertEqual("v1\n", self.state.read_text())
+                    self.assertTrue(self.failure.closed)
+            self.failure = None
+            gc.collect()
+        self.assertFalse([w for w in caught if issubclass(w.category, ResourceWarning)])
         self.assertEqual(0, app.main())
         self.assertEqual("v3\n", self.state.read_text())
         self.assertNotIn("stub-secret", self.errors.getvalue())
