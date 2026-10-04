@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import sys
+import tempfile
 import datetime
 import urllib.error
 import urllib.request
@@ -95,7 +96,18 @@ def read_last_tag(state_file: pathlib.Path) -> str | None:
 def write_last_tag(state_file: pathlib.Path, tag_name: str) -> None:
     """状態ファイルへ最新タグを保存します。"""
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(f"{tag_name}\n", encoding="utf-8")
+    temporary_path: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=state_file.parent,
+            prefix=f".{state_file.name}.", delete=False,
+        ) as temporary:
+            temporary_path = pathlib.Path(temporary.name)
+            temporary.write(f"{tag_name}\n")
+        os.replace(temporary_path, state_file)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def notify_discord(releases: list[dict], webhook_url: str | None) -> bool:
@@ -147,8 +159,8 @@ def notify_discord(releases: list[dict], webhook_url: str | None) -> bool:
         return True
 
     if webhook_url is None or not webhook_url.strip():
-        print(f"Discord webhook URLが未設定のため通知をスキップしました: {', '.join(tag_names)}")
-        return True
+        print("Discord webhook URLが未設定のため通知できません。未配信タグの状態は更新しません。", file=sys.stderr)
+        return False
 
     payload: dict[str, object] = {
         "username": "Playwrightリリース監視",
@@ -163,10 +175,10 @@ def notify_discord(releases: list[dict], webhook_url: str | None) -> bool:
         with urllib.request.urlopen(request, timeout=10) as response:
             status_code = response.getcode()
     except urllib.error.HTTPError as error:
-        print(f"Discord通知に失敗しました: HTTP {error.code} {error.reason}", file=sys.stderr)
+        print(f"Discord通知に失敗しました: HTTP {error.code}", file=sys.stderr)
         return False
-    except urllib.error.URLError as error:
-        print(f"Discord通知に失敗しました: {error.reason}", file=sys.stderr)
+    except (urllib.error.URLError, OSError):
+        print("Discord通知に失敗しました: 通信エラー", file=sys.stderr)
         return False
 
     if status_code < 200 or status_code >= 300:
